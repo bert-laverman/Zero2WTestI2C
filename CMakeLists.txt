@@ -30,9 +30,9 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O2")
 set(TARGET_PICO off)
 set(TARGET_ZERO2W on)
 set(HAVE_I2C on)
-set(HAVE_SPI on)
+set(HAVE_SPI off)
 set(HAVE_PWM off)
-set(HAVE_MAX7219 on)
+set(HAVE_MAX7219 off)
 
 #
 # The CppRaspberry library location is taken from the CPP_RASPBERRY_PATH environment variable
