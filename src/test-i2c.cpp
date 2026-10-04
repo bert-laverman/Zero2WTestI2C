@@ -23,6 +23,7 @@
 #include <algorithm>
 
 #include <memory>
+#include <set>
 #include <thread>
 #include <chrono>
 
@@ -32,6 +33,7 @@
 #include <protocols/i2c-protocol-driver.hpp>
 #include <protocols/i2c-device-handler.hpp>
 #include <util/message-queue.hpp>
+#include <devices/remote-max7219.hpp>
 
 #include "i2c-ini.hpp"
 
@@ -51,6 +53,7 @@ static I2CState config;
 static std::map<uint64_t, uint8_t> addressById;
 static std::map<uint8_t, uint64_t> idByAddress;
 static constexpr uint8_t firstPico{ 0x61 };
+static std::set<uint8_t> online;                 // addresses of boards that have announced themselves
 
 /**
  * An address we have given out, and for which we have not seen the board announce itself on that address yet.
@@ -202,8 +205,10 @@ static void processHello(HandlerType& handler, uint8_t sender, const MsgHello& m
             std::cerr << std::format("- Board confirmed its address 0x{:02x}.\n", sender);
             rememberBoard(it->second.boardId, sender);
             pending.erase(it);
+            online.insert(sender);
         } else {
             std::cerr << std::format("- Board announced itself on address 0x{:02x}.\n", sender);
+            online.insert(sender);
         }
     }
 }
@@ -244,9 +249,11 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char*argv[])
     std::cerr << std::format("Loaded {} boards.\n", config.countBoardIds());
 
     unsigned count{30};
-    if (argc == 2) {
+    if (argc >= 2) {
         count = atoi(argv[1]);
     }
+    // An optional second argument: the address of a board with a MAX7219 8-digit display, which will count the seconds.
+    const uint8_t maxAddress = (argc >= 3) ? static_cast<uint8_t>(std::strtoul(argv[2], nullptr, 0)) : 0;
     auto pi2picoBus = std::make_shared<interfaces::I2CDevI2C>("/dev/i2c-1");
     auto pico2piBus = std::make_shared<interfaces::PigpiodBSCI2C>();
     pi2picoBus->verbose(true);
@@ -271,6 +278,15 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char*argv[])
     driver.listenAddress(controllerAddress);
     driver.startListening();
 
+    using RemoteMax = devices::RemoteMAX7219<I2CProtocolDriver<util::MessageQueue>>;
+    std::unique_ptr<RemoteMax> max;
+    bool maxStarted{ false };
+    if (maxAddress != 0) {
+        max = std::make_unique<RemoteMax>(driver, maxAddress);
+        max->numDevices(1);
+        std::cerr << std::format("The MAX7219 on the board with address 0x{:02x} will count the seconds.\n", maxAddress);
+    }
+
     std::cerr << "Starting to wait for someone to talk to us.\n";
 
     // One tick is 10 ms: the incoming messages are handled, and unconfirmed addresses resent, every tick. A Hello goes
@@ -284,6 +300,20 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char*argv[])
 
         driver.processIncoming();
         resendUnconfirmed(deviceHandler);
+
+        // Once the board with the display is there: set it up, and count the seconds.
+        if (max && (online.count(maxAddress) != 0) && (tick % 100 == 50)) {
+            if (!maxStarted) {
+                max->reset();
+                max->setBrightness(3);
+                maxStarted = true;
+            }
+            max->setNumber(0, static_cast<int32_t>(tick / 100));
+        }
+    }
+
+    if (max && maxStarted) {
+        max->clear();
     }
 
     std::cerr << "Shutting down.\n";
