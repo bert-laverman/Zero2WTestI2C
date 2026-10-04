@@ -111,8 +111,8 @@ static void loadBoardsFromConfig()
     for (auto key : config.boardIds()) {
         std::cerr << "Checking board '" << key << "' for I2C address info.\n";
 
-        if (config.hasBoardValue(key, "boardId") && config.hasBoardValue(key, "address")) {
-            auto configId = config.boardValue(key, "boardId");
+        if (config.hasBoardValue(key, "boardid") && config.hasBoardValue(key, "address")) {
+            auto configId = config.boardValue(key, "boardid");
             auto address = atoi(config.boardValue(key, "address").c_str());
 
             BoardId id;
@@ -129,6 +129,35 @@ static void loadBoardsFromConfig()
             std::cerr << "- Nothing for '" << key << "'.\n";
         }
     }
+}
+
+
+static std::string boardIdString(const BoardId& id)
+{
+    return std::format("{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}",
+                       id.bytes[0], id.bytes[1], id.bytes[2], id.bytes[3], id.bytes[4], id.bytes[5], id.bytes[6], id.bytes[7]);
+}
+
+/**
+ * Save the address of a board that confirmed it, so the board gets the same address after we have been restarted. A
+ * board that is already in the state file keeps its section (and name), a new one gets its board id as name.
+ */
+static void rememberBoard(const BoardId& id, uint8_t address)
+{
+    const std::string boardId{ boardIdString(id) };
+    std::string name{ boardId };
+    for (auto key : config.boardIds()) {
+        if (config.hasBoardValue(key, "boardid") && (config.boardValue(key, "boardid") == boardId)) {
+            name = key;
+            break;
+        }
+    }
+    if (config.hasBoardValue(name, "address") && (std::atoi(config.boardValue(name, "address").c_str()) == address)) {
+        return;     // already saved
+    }
+    config.setBoardValue(name, "boardid", boardId);
+    config.setBoardValue(name, "address", std::to_string(address));
+    config.save();
 }
 
 
@@ -171,6 +200,7 @@ static void processHello(HandlerType& handler, uint8_t sender, const MsgHello& m
         auto it = pending.find(msg.boardId.id);
         if ((it != pending.end()) && (it->second.address == sender)) {
             std::cerr << std::format("- Board confirmed its address 0x{:02x}.\n", sender);
+            rememberBoard(it->second.boardId, sender);
             pending.erase(it);
         } else {
             std::cerr << std::format("- Board announced itself on address 0x{:02x}.\n", sender);
