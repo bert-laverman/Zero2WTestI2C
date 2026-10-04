@@ -22,6 +22,7 @@
 
 #include <algorithm>
 
+#include <cstdlib>
 #include <memory>
 #include <vector>
 #include <thread>
@@ -145,6 +146,30 @@ static void rememberBoard(const BoardId& id, uint8_t address)
 }
 
 
+/**
+ * Set MAX_DEMO=brightness to compare displays instead of counting: every 4 seconds they go through all segments on full
+ * strength (the test mode of the chip, whatever the brightness), and then 88888888 at brightness 0, 3, 7 and 15.
+ */
+template <typename Display>
+static void brightnessStep(Display& max, int32_t seconds, bool say)
+{
+    static constexpr uint8_t levels[] = { 0, 3, 7, 15 };
+    const unsigned step = (static_cast<unsigned>(seconds) / 4) % 5;
+    if (static_cast<unsigned>(seconds) % 4 != 0) {
+        return;
+    }
+    if (step == 0) {
+        if (say) { std::cerr << "Brightness: all segments on, full strength (test mode)\n"; }
+        max.displayTest(1);
+    } else {
+        if (step == 1) { max.displayTest(0); }
+        if (say) { std::cerr << std::format("Brightness: 88888888 at {}\n", levels[step - 1]); }
+        max.setBrightness(levels[step - 1]);
+        max.setNumber(0, 88888888);
+    }
+}
+
+
 int main([[maybe_unused]] int argc, [[maybe_unused]] char*argv[])
 {
     config.load();
@@ -155,6 +180,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char*argv[])
     }
     // The other arguments are the addresses of boards with a MAX7219 8-digit display. The first one counts the seconds up, the
     // second counts down, and so on.
+    const bool brightnessDemo = (std::getenv("MAX_DEMO") != nullptr) && (std::string(std::getenv("MAX_DEMO")) == "brightness");
     std::vector<uint8_t> maxAddresses;
     for (int i = 2; i < argc; i++) {
         maxAddresses.push_back(static_cast<uint8_t>(std::strtoul(argv[i], nullptr, 0)));
@@ -207,7 +233,7 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char*argv[])
 
         driver.processIncoming();
 
-        // Once a board with a display is there: set it up, and count.
+        // Once a board with a display is there: set it up, and count, or compare brightness.
         if (tick % 100 == 50) {
             const int32_t seconds = static_cast<int32_t>(tick / 100);
             for (size_t i = 0; i < displays.size(); i++) {
@@ -220,7 +246,11 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char*argv[])
                     display.max->setBrightness(3);
                     display.started = true;
                 }
-                display.max->setNumber(0, (i % 2 == 0) ? seconds : static_cast<int32_t>(count) - seconds);
+                if (brightnessDemo) {
+                    brightnessStep(*display.max, seconds, i == 0);
+                } else {
+                    display.max->setNumber(0, (i % 2 == 0) ? seconds : static_cast<int32_t>(count) - seconds);
+                }
             }
         }
     }
