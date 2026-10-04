@@ -52,6 +52,21 @@ static std::map<uint64_t, uint8_t> addressById;
 static std::map<uint8_t, uint64_t> idByAddress;
 static constexpr uint8_t firstPico{ 0x61 };
 
+/**
+ * An address we have given out, and for which we have not seen the board announce itself on that address yet.
+ * (A board does that with a Hello from its new address, as soon as it has taken it over.) If the announcement stays
+ * away, the SetAddress did not reach the board, and we send it again.
+ */
+struct Pending {
+    BoardId boardId;
+    uint8_t address;
+    unsigned attempts;
+    std::chrono::steady_clock::time_point lastSent;
+};
+static std::map<uint64_t, Pending> pending;     // by board id
+static constexpr std::chrono::milliseconds resendAfter{ 100 };
+static constexpr unsigned maxAttempts{ 5 };
+
 static bool parseHex(uint8_t& byte, char h1, char h2) {
     uint8_t b;
     if ((h1 >= '0') && (h1 <= '9')) {
@@ -142,12 +157,48 @@ static void processHello(HandlerType& handler, uint8_t sender, const MsgHello& m
             std::cerr << std::format("- We know this one: It has address 0x{:02x}.\n", picoAddress);
         }
         if (picoAddress != 0x00) {
+            // Keep the address for this board, whether or not the SetAddress got through: if it did not, we will send it
+            // again, and another board must not get the same address in the meantime.
+            idByAddress [picoAddress] = msg.boardId.id;
+            addressById [msg.boardId.id] = picoAddress;
             if (!handler.sendSetAddress(msg.boardId, picoAddress)) {
                 std::cerr << std::format("* Failed to send address 0x{:02x}.\n", picoAddress);
-            } else {
-                idByAddress [picoAddress] = msg.boardId.id;
-                addressById [msg.boardId.id] = picoAddress;
             }
+            pending[msg.boardId.id] = Pending{ msg.boardId, picoAddress, 1, std::chrono::steady_clock::now() };
+        }
+    } else {
+        // A board that has an address announces itself.
+        auto it = pending.find(msg.boardId.id);
+        if ((it != pending.end()) && (it->second.address == sender)) {
+            std::cerr << std::format("- Board confirmed its address 0x{:02x}.\n", sender);
+            pending.erase(it);
+        } else {
+            std::cerr << std::format("- Board announced itself on address 0x{:02x}.\n", sender);
+        }
+    }
+}
+
+
+/**
+ * Send the SetAddress again for every address that has not been confirmed within a short while, a limited number of times.
+ */
+template <typename HandlerType>
+static void resendUnconfirmed(HandlerType& handler)
+{
+    const auto now = std::chrono::steady_clock::now();
+    for (auto it = pending.begin(); it != pending.end(); ) {
+        Pending& entry = it->second;
+        if ((now - entry.lastSent) < resendAfter) {
+            ++it;
+        } else if (entry.attempts >= maxAttempts) {
+            std::cerr << std::format("* No confirmation of address 0x{:02x}, giving up.\n", entry.address);
+            it = pending.erase(it);
+        } else {
+            std::cerr << std::format("- No confirmation yet of address 0x{:02x}, sending it again.\n", entry.address);
+            handler.sendSetAddress(entry.boardId, entry.address);
+            entry.attempts++;
+            entry.lastSent = now;
+            ++it;
         }
     }
 }
@@ -192,12 +243,17 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char*argv[])
 
     std::cerr << "Starting to wait for someone to talk to us.\n";
 
-    for (unsigned outer = 0; outer < count; outer++) {
-        deviceHandler.sendHello(controllerId);
+    // One tick is 10 ms: the incoming messages are handled, and unconfirmed addresses resent, every tick. A Hello goes
+    // out once per second.
+    for (unsigned tick = 0; tick < count * 100; tick++) {
+        if (tick % 100 == 0) {
+            deviceHandler.sendHello(controllerId);
+        }
 
-        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
         driver.processIncoming();
+        resendUnconfirmed(deviceHandler);
     }
 
     std::cerr << "Shutting down.\n";
