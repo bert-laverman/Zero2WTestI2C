@@ -23,7 +23,7 @@
 #include <algorithm>
 
 #include <memory>
-#include <set>
+#include <vector>
 #include <thread>
 #include <chrono>
 
@@ -31,7 +31,7 @@
 #include <interfaces/pigpiod-i2c.hpp>
 #include <interfaces/i2cdev-i2c.hpp>
 #include <protocols/i2c-protocol-driver.hpp>
-#include <protocols/i2c-device-handler.hpp>
+#include <protocols/i2c-bus-controller.hpp>
 #include <util/message-queue.hpp>
 #include <devices/remote-max7219.hpp>
 
@@ -50,25 +50,7 @@ using nl::rakis::i2c::I2CState;
 static I2CState config;
 
 
-static std::map<uint64_t, uint8_t> addressById;
-static std::map<uint8_t, uint64_t> idByAddress;
-static constexpr uint8_t firstPico{ 0x61 };
-static std::set<uint8_t> online;                 // addresses of boards that have announced themselves
-
-/**
- * An address we have given out, and for which we have not seen the board announce itself on that address yet.
- * (A board does that with a Hello from its new address, as soon as it has taken it over.) If the announcement stays
- * away, the SetAddress did not reach the board, and we send it again.
- */
-struct Pending {
-    BoardId boardId;
-    uint8_t address;
-    unsigned attempts;
-    std::chrono::steady_clock::time_point lastSent;
-};
-static std::map<uint64_t, Pending> pending;     // by board id
-static constexpr std::chrono::milliseconds resendAfter{ 100 };
-static constexpr unsigned maxAttempts{ 5 };
+static constexpr uint8_t firstPico{ 0x61 };      // the first address we hand out; saved addresses below this are ignored
 
 static bool parseHex(uint8_t& byte, char h1, char h2) {
     uint8_t b;
@@ -109,7 +91,7 @@ static bool parseBoardId(uint8_t bytes[8], const std::string& s) {
         && parseHex(bytes [7], s [15], s [16]);
 }
 
-static void loadBoardsFromConfig()
+static void loadBoardsFromConfig(I2CBusController<I2CProtocolDriver<util::MessageQueue>>& controller)
 {
     for (auto key : config.boardIds()) {
         std::cerr << "Checking board '" << key << "' for I2C address info.\n";
@@ -125,8 +107,7 @@ static void loadBoardsFromConfig()
                 std::cerr << std::format("Ignoring bad address 0x{:02x} for board '{}'.\n", address, key);
             } else {
                 std::cerr << std::format("Board '{}', id '{}', address 0x{:02x}.\n", key, configId, address);
-                addressById[id.id] = address;
-                idByAddress[address] = id.id;
+                controller.addKnown(id, static_cast<uint8_t>(address));
             }
         } else {
             std::cerr << "- Nothing for '" << key << "'.\n";
@@ -164,96 +145,20 @@ static void rememberBoard(const BoardId& id, uint8_t address)
 }
 
 
-template <typename HandlerType>
-static void processHello(HandlerType& handler, uint8_t sender, const MsgHello& msg)
-{
-    std::cerr << std::format("Received Hello message from 0x{:02x}, board with Id {:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}\n",
-                            sender,
-                             msg.boardId.bytes[0], msg.boardId.bytes[1], msg.boardId.bytes[2], msg.boardId.bytes[3],
-                             msg.boardId.bytes[4], msg.boardId.bytes[5], msg.boardId.bytes[6], msg.boardId.bytes[7]);
-
-    if (sender == 0x00) {
-        // A Pico is asking for an address
-        uint8_t picoAddress{ 0x00 };
-        auto it = addressById.find(msg.boardId.id);
-        if (it == addressById.end()) {
-            for (auto i = firstPico; i < 0x7f; i++){
-                if (idByAddress.find(i) == idByAddress.end()) {
-                    std::cerr << std::format("- We'll give this board address 0x{:02x}.\n", i);
-                    picoAddress = i;
-                    break;
-                }
-            }
-        } else {
-            picoAddress = addressById [msg.boardId.id];
-            std::cerr << std::format("- We know this one: It has address 0x{:02x}.\n", picoAddress);
-        }
-        if (picoAddress != 0x00) {
-            // Keep the address for this board, whether or not the SetAddress got through: if it did not, we will send it
-            // again, and another board must not get the same address in the meantime.
-            idByAddress [picoAddress] = msg.boardId.id;
-            addressById [msg.boardId.id] = picoAddress;
-            if (!handler.sendSetAddress(msg.boardId, picoAddress)) {
-                std::cerr << std::format("* Failed to send address 0x{:02x}.\n", picoAddress);
-            }
-            pending[msg.boardId.id] = Pending{ msg.boardId, picoAddress, 1, std::chrono::steady_clock::now() };
-        }
-    } else {
-        // A board that has an address announces itself.
-        auto it = pending.find(msg.boardId.id);
-        if ((it != pending.end()) && (it->second.address == sender)) {
-            std::cerr << std::format("- Board confirmed its address 0x{:02x}.\n", sender);
-            rememberBoard(it->second.boardId, sender);
-            pending.erase(it);
-            online.insert(sender);
-        } else {
-            std::cerr << std::format("- Board announced itself on address 0x{:02x}.\n", sender);
-            online.insert(sender);
-        }
-    }
-}
-
-
-/**
- * Send the SetAddress again for every address that has not been confirmed within a short while, a limited number of times.
- */
-template <typename HandlerType>
-static void resendUnconfirmed(HandlerType& handler)
-{
-    const auto now = std::chrono::steady_clock::now();
-    for (auto it = pending.begin(); it != pending.end(); ) {
-        Pending& entry = it->second;
-        if ((now - entry.lastSent) < resendAfter) {
-            ++it;
-        } else if (entry.attempts >= maxAttempts) {
-            std::cerr << std::format("* No confirmation of address 0x{:02x}, giving up.\n", entry.address);
-            it = pending.erase(it);
-        } else {
-            std::cerr << std::format("- No confirmation yet of address 0x{:02x}, sending it again.\n", entry.address);
-            handler.sendSetAddress(entry.boardId, entry.address);
-            entry.attempts++;
-            entry.lastSent = now;
-            ++it;
-        }
-    }
-}
-
-
-static BoardId controllerId{ .id = ControllerId };
-
-
 int main([[maybe_unused]] int argc, [[maybe_unused]] char*argv[])
 {
     config.load();
-    loadBoardsFromConfig();
-    std::cerr << std::format("Loaded {} boards.\n", config.countBoardIds());
 
     unsigned count{30};
     if (argc >= 2) {
         count = atoi(argv[1]);
     }
-    // An optional second argument: the address of a board with a MAX7219 8-digit display, which will count the seconds.
-    const uint8_t maxAddress = (argc >= 3) ? static_cast<uint8_t>(std::strtoul(argv[2], nullptr, 0)) : 0;
+    // The other arguments are the addresses of boards with a MAX7219 8-digit display. The first one counts the seconds up, the
+    // second counts down, and so on.
+    std::vector<uint8_t> maxAddresses;
+    for (int i = 2; i < argc; i++) {
+        maxAddresses.push_back(static_cast<uint8_t>(std::strtoul(argv[i], nullptr, 0)));
+    }
     auto pi2picoBus = std::make_shared<interfaces::I2CDevI2C>("/dev/i2c-1");
     auto pico2piBus = std::make_shared<interfaces::PigpiodBSCI2C>();
     pi2picoBus->verbose(true);
@@ -262,14 +167,15 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char*argv[])
     I2CProtocolDriver<util::MessageQueue> driver;
     driver.addInterface(pi2picoBus);
     driver.addInterface(pico2piBus);
-    I2CDeviceHandler<I2CProtocolDriver<util::MessageQueue>> deviceHandler(driver, controllerId);
 
-    driver.registerHandler(Command::Hello, "Hello handler", [&driver,&deviceHandler]([[maybe_unused]] Command command, uint8_t sender, const std::vector<uint8_t>& data) -> void {
-        if (data.size() == sizeof(MsgHello)) {
-            const MsgHello* msg = reinterpret_cast<const MsgHello*>(data.data());
-            processHello(deviceHandler, sender, *msg);
-        }
-    });
+    // The bus controller hands out the addresses. We keep them in the state file: the ones we know go in, and the ones that
+    // boards confirm are saved.
+    I2CBusController controller(driver);
+    controller.addressRange(firstPico, 0x77);
+    loadBoardsFromConfig(controller);
+    std::cerr << std::format("Loaded {} boards.\n", config.countBoardIds());
+    controller.onConfirmed([](const BoardId& id, uint8_t address) { rememberBoard(id, address); });
+    controller.registerHandlers();
 
     std::cerr << "Starting test\n";
 
@@ -279,41 +185,50 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char*argv[])
     driver.startListening();
 
     using RemoteMax = devices::RemoteMAX7219<I2CProtocolDriver<util::MessageQueue>>;
-    std::unique_ptr<RemoteMax> max;
-    bool maxStarted{ false };
-    if (maxAddress != 0) {
-        max = std::make_unique<RemoteMax>(driver, maxAddress);
-        max->numDevices(1);
-        std::cerr << std::format("The MAX7219 on the board with address 0x{:02x} will count the seconds.\n", maxAddress);
+    struct Display {
+        std::unique_ptr<RemoteMax> max;
+        bool started{ false };
+    };
+    std::vector<Display> displays;
+    for (auto address : maxAddresses) {
+        displays.push_back(Display{ std::make_unique<RemoteMax>(driver, address) });
+        displays.back().max->numDevices(1);
+        std::cerr << std::format("The MAX7219 on the board with address 0x{:02x} will count {}.\n", address,
+                                 (displays.size() % 2 == 1) ? "the seconds" : "down");
     }
 
     std::cerr << "Starting to wait for someone to talk to us.\n";
 
-    // One tick is 10 ms: the incoming messages are handled, and unconfirmed addresses resent, every tick. A Hello goes
-    // out once per second.
+    // One tick is 10 ms. The controller says Hello once per second, and repeats the addresses that were not confirmed.
     for (unsigned tick = 0; tick < count * 100; tick++) {
-        if (tick % 100 == 0) {
-            deviceHandler.sendHello(controllerId);
-        }
+        controller.tick();
 
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
 
         driver.processIncoming();
-        resendUnconfirmed(deviceHandler);
 
-        // Once the board with the display is there: set it up, and count the seconds.
-        if (max && (online.count(maxAddress) != 0) && (tick % 100 == 50)) {
-            if (!maxStarted) {
-                max->reset();
-                max->setBrightness(3);
-                maxStarted = true;
+        // Once a board with a display is there: set it up, and count.
+        if (tick % 100 == 50) {
+            const int32_t seconds = static_cast<int32_t>(tick / 100);
+            for (size_t i = 0; i < displays.size(); i++) {
+                auto& display = displays[i];
+                if (!controller.isOnline(maxAddresses[i])) {
+                    continue;
+                }
+                if (!display.started) {
+                    display.max->reset();
+                    display.max->setBrightness(3);
+                    display.started = true;
+                }
+                display.max->setNumber(0, (i % 2 == 0) ? seconds : static_cast<int32_t>(count) - seconds);
             }
-            max->setNumber(0, static_cast<int32_t>(tick / 100));
         }
     }
 
-    if (max && maxStarted) {
-        max->clear();
+    for (auto& display : displays) {
+        if (display.started) {
+            display.max->clear();
+        }
     }
 
     std::cerr << "Shutting down.\n";
