@@ -22,6 +22,7 @@
 
 #include <algorithm>
 
+#include <csignal>
 #include <cstdlib>
 #include <memory>
 #include <vector>
@@ -170,8 +171,19 @@ static void brightnessStep(Display& max, int32_t seconds, bool say)
 }
 
 
+/**
+ * Stop on Ctrl-C or a kill: leave the loop, so that the BSC slave is switched off on the way out. A program that is simply
+ * killed in the middle of a transfer leaves the BSC slave holding SCL low, and then nobody can use the bus.
+ */
+static volatile std::sig_atomic_t stopRequested{ 0 };
+static void onSignal(int) { stopRequested = 1; }
+
+
 int main([[maybe_unused]] int argc, [[maybe_unused]] char*argv[])
 {
+    std::signal(SIGINT, onSignal);
+    std::signal(SIGTERM, onSignal);
+
     config.load();
 
     unsigned count{30};
@@ -223,10 +235,23 @@ int main([[maybe_unused]] int argc, [[maybe_unused]] char*argv[])
                                  (displays.size() % 2 == 1) ? "the seconds" : "down");
     }
 
+    // A board that appears (also one that restarted) has lost whatever it showed: set the display up again.
+    controller.onBoardAppeared([&displays, &maxAddresses](const BoardId& id, uint8_t address) {
+        std::cerr << std::format("*** Board {} appeared on address 0x{:02x}.\n", boardIdString(id), address);
+        for (size_t i = 0; i < displays.size(); i++) {
+            if (maxAddresses[i] == address) {
+                displays[i].started = false;
+            }
+        }
+    });
+    controller.onBoardGone([](const BoardId& id, uint8_t address) {
+        std::cerr << std::format("*** Board {} on address 0x{:02x} is gone.\n", boardIdString(id), address);
+    });
+
     std::cerr << "Starting to wait for someone to talk to us.\n";
 
     // One tick is 10 ms. The controller says Hello once per second, and repeats the addresses that were not confirmed.
-    for (unsigned tick = 0; tick < count * 100; tick++) {
+    for (unsigned tick = 0; (tick < count * 100) && !stopRequested; tick++) {
         controller.tick();
 
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
